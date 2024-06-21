@@ -9,6 +9,7 @@ import qualified Data.ByteString as B
 import Data.IORef
 import Network.Socket
 import qualified Network.Socket.ByteString as N
+import Control.Concurrent (threadWaitRead)
 
 -- | Reading n bytes.
 type ReadN = Int -> IO B.ByteString
@@ -21,7 +22,10 @@ defaultReadN s ref n = do
     writeIORef ref Nothing
     case mbs of
         Nothing -> do
-            bs <- N.recv s n
+            bs <-
+              withFdSocket s $ \fd -> do
+                threadWaitRead (fromIntegral fd)
+                N.recv s n
             if B.null bs
                 then return B.empty
                 else
@@ -38,7 +42,10 @@ defaultReadN s ref n = do
   where
     loop bs = do
         let n' = n - B.length bs
-        bs1 <- N.recv s n'
+        bs1 <-
+          withFdSocket s $ \fd -> do
+            threadWaitRead (fromIntegral fd)
+            N.recv s n'
         if B.null bs1
             then return B.empty
             else do
