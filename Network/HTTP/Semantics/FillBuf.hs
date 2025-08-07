@@ -119,7 +119,10 @@ fillStreamBodyGetNext takeQ = loop 0
   where
     loop :: NextWithTotal
     loop total = DynaNext $ \buf room -> do
-        putStrLn "\n\nHTTP-SEMANTICS: TAKING QUEUE\n\n"
+        putStrLn $
+            "\n\nHTTP-SEMANTICS: TAKING QUEUE "
+                ++ prettyCallStack callStack
+                ++ "\n\n"
         mChunk <- takeQ
         putStrLn "\n\nHTTP-SEMANTICS: TOOK QUEUE\n\n"
         case mChunk of
