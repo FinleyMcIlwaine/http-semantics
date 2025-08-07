@@ -2,11 +2,14 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE MultiWayIf #-}
 
 module Network.HTTP.Semantics.FillBuf (
     -- * Filling a buffer
     Next (..),
-    DynaNext,
+    DynaNext(..),
+    getDynaNext,
     BytesFilled,
     StreamingChunk (..),
     IsEndOfStream (..),
@@ -27,6 +30,7 @@ import Data.Maybe
 import Foreign.Ptr (plusPtr)
 import Network.ByteOrder
 import Network.HTTP.Semantics.Client
+import GHC.Stack
 
 ----------------------------------------------------------------
 
@@ -34,20 +38,31 @@ import Network.HTTP.Semantics.Client
 --
 -- In @http2@ this will be used to construct a single HTTP2 @DATA@ frame
 -- (see discussion of the maximum number of bytes, below).
-type DynaNext =
-    Buffer
-    -- ^ Write buffer
-    -> Int
-    -- ^ Maximum number of bytes we are allowed to write
-    --
-    -- In @http2@, this maximum will be set to the space left in the write
-    -- buffer. Implicitly this also means that this maximum cannot exceed the
-    -- maximum size of a HTTP2 frame, since in @http2@ the size of the write
-    -- buffer is also used to set @SETTINGS_MAX_FRAME_SIZE@ (see
-    -- @confBufferSize@).
-    -> IO Next
-    -- ^ Information on the data written, and on how to continue if not all data
-    -- was written
+newtype DynaNext = DynaNext
+    { getDynaNext_ ::
+        HasCallStack =>
+        Buffer
+        -- ^ Write buffer
+        -> Int
+        -- ^ Maximum number of bytes we are allowed to write
+        --
+        -- In @http2@, this maximum will be set to the space left in the write
+        -- buffer. Implicitly this also means that this maximum cannot exceed the
+        -- maximum size of a HTTP2 frame, since in @http2@ the size of the write
+        -- buffer is also used to set @SETTINGS_MAX_FRAME_SIZE@ (see
+        -- @confBufferSize@).
+        -> IO Next
+        -- ^ Information on the data written, and on how to continue if not all data
+        -- was written
+    }
+
+getDynaNext ::
+    HasCallStack =>
+        DynaNext
+        -> Buffer
+        -> Int
+        -> IO Next
+getDynaNext (DynaNext f) = f
 
 type BytesFilled = Int
 
@@ -88,13 +103,13 @@ data IsEndOfStream
 ----------------------------------------------------------------
 
 fillBuilderBodyGetNext :: Builder -> DynaNext
-fillBuilderBodyGetNext bb buf room = do
+fillBuilderBodyGetNext bb = DynaNext $ \buf room -> do
     (len, signal) <- B.runBuilder bb buf room
     return $ nextForBuilder len signal
 
 fillFileBodyGetNext
     :: PositionRead -> FileOffset -> ByteCount -> Sentinel -> DynaNext
-fillFileBodyGetNext pread start bytecount sentinel buf room = do
+fillFileBodyGetNext pread start bytecount sentinel = DynaNext $ \buf room -> do
     len <- pread start (mini room bytecount) buf
     let len' = fromIntegral len
     nextForFile len' pread (start + len) (bytecount - len) sentinel
@@ -103,14 +118,14 @@ fillStreamBodyGetNext :: IO (Maybe StreamingChunk) -> DynaNext
 fillStreamBodyGetNext takeQ = loop 0
   where
     loop :: NextWithTotal
-    loop total buf room = do
+    loop total = DynaNext $ \buf room -> do
         putStrLn "\n\nHTTP-SEMANTICS: TAKING QUEUE\n\n"
         mChunk <- takeQ
         putStrLn "\n\nHTTP-SEMANTICS: TOOK QUEUE\n\n"
         case mChunk of
             Just chunk -> do
                 putStrLn "\n\nHTTP-SEMANTICS: QUEUE GAVE JUST\n\n"
-                runStreamingChunk chunk loop total buf room
+                getDynaNext (runStreamingChunk chunk loop total) buf room
             Nothing -> do
                 putStrLn "\n\nHTTP-SEMANTICS: QUEUE GAVE NOTHING\n\n"
                 return $ Next total False (Just $ loop 0)
@@ -118,7 +133,7 @@ fillStreamBodyGetNext takeQ = loop 0
 ----------------------------------------------------------------
 
 fillBufBuilderOne :: Int -> B.BufferWriter -> DynaNext
-fillBufBuilderOne minReq writer buf0 room = do
+fillBufBuilderOne minReq writer = DynaNext $ \buf0 room -> do
     if room >= minReq
         then do
             (len, signal) <- writer buf0 room
@@ -127,16 +142,17 @@ fillBufBuilderOne minReq writer buf0 room = do
             return $ Next 0 True (Just $ fillBufBuilderOne minReq writer)
 
 fillBufBuilderTwo :: ByteString -> B.BufferWriter -> DynaNext
-fillBufBuilderTwo bs writer buf0 room
-    | BS.length bs <= room = do
-        buf1 <- copy buf0 bs
-        let len1 = BS.length bs
-        (len2, signal) <- writer buf1 (room - len1)
-        return $ nextForBuilder (len1 + len2) signal
-    | otherwise = do
-        let (bs1, bs2) = BS.splitAt room bs
-        void $ copy buf0 bs1
-        return $ nextForBuilder room (B.Chunk bs2 writer)
+fillBufBuilderTwo bs writer =
+    DynaNext $ \buf0 room ->
+        if  | BS.length bs <= room -> do
+                buf1 <- copy buf0 bs
+                let len1 = BS.length bs
+                (len2, signal) <- writer buf1 (room - len1)
+                return $ nextForBuilder (len1 + len2) signal
+            | otherwise -> do
+                let (bs1, bs2) = BS.splitAt room bs
+                void $ copy buf0 bs1
+                return $ nextForBuilder room (B.Chunk bs2 writer)
 
 nextForBuilder :: BytesFilled -> B.Next -> Next
 nextForBuilder len B.Done =
@@ -166,12 +182,12 @@ runStreamingChunk chunk next =
         StreamingBuilder builder (EndOfStream mdec) -> runStreamingBuilder builder (finished mdec)
   where
     finished :: Maybe CleanupStream -> NextWithTotal
-    finished mdec = \total _buf _room -> do
+    finished mdec = \total -> DynaNext $ \_ _ -> do
         fromMaybe (return ()) mdec
         return $ Next total True Nothing
 
     flush :: NextWithTotal
-    flush = \total _buf _room -> do
+    flush = \total -> DynaNext $ \_ _ -> do
         putStrLn "\n\nHTTP-SEMANTICS: RETURNING FROM NEXTWITHTOTAL\n\n"
         return $ Next total True (Just $ next 0)
 
@@ -184,42 +200,42 @@ runStreamingChunk chunk next =
     -- will be discarded on cancellation. We can therefore simply ignore
     -- @_total@ here.
     cancel :: Maybe SomeException -> NextWithTotal
-    cancel mErr = \_total _buf _room -> pure $ CancelNext mErr
+    cancel mErr = \_total -> DynaNext $ \_ _ -> pure $ CancelNext mErr
 
 -- | Run 'Builder' until completion, then continue as specified
 runStreamingBuilder :: Builder -> NextWithTotal -> NextWithTotal
-runStreamingBuilder builder next = \total buf room -> do
+runStreamingBuilder builder next = \total -> DynaNext $ \buf room -> do
     writeResult <- B.runBuilder builder buf room
-    ranWriter writeResult total buf room
+    getDynaNext (ranWriter writeResult total) buf room
   where
     ranWriter :: (Int, B.Next) -> NextWithTotal
-    ranWriter (len, signal) = \total buf room -> do
+    ranWriter (len, signal) = \total -> DynaNext $ \buf room -> do
         let total' = total + len
         case signal of
             B.Done ->
-                next total' (buf `plusPtr` len) (room - len)
+                getDynaNext (next total') (buf `plusPtr` len) (room - len)
             B.More minReq writer ->
                 return $ Next total' False (Just $ goMore (Just minReq) writer 0)
             B.Chunk bs writer ->
                 return $ Next total' False (Just $ goChunk bs writer 0)
 
     goMore :: Maybe Int -> B.BufferWriter -> NextWithTotal
-    goMore mMinReq writer = \total buf room -> do
+    goMore mMinReq writer = \total -> DynaNext $ \buf room -> do
         let enoughRoom = maybe True (room >=) mMinReq
         if enoughRoom
             then do
                 writeResult <- writer buf room
-                ranWriter writeResult total buf room
+                getDynaNext (ranWriter writeResult total) buf room
             else do
                 return $ Next total True (Just $ goMore mMinReq writer 0)
 
     goChunk :: ByteString -> B.BufferWriter -> NextWithTotal
-    goChunk bs writer = \total buf room ->
+    goChunk bs writer = \total -> DynaNext $ \buf room ->
         if BS.length bs <= room
             then do
                 buf' <- copy buf bs
                 let len = BS.length bs
-                goMore Nothing writer (total + len) buf' (room - len)
+                getDynaNext (goMore Nothing writer (total + len)) buf' (room - len)
             else do
                 let (bs1, bs2) = BS.splitAt room bs
                 void $ copy buf bs1
@@ -228,7 +244,7 @@ runStreamingBuilder builder next = \total buf room -> do
 ----------------------------------------------------------------
 
 fillBufFile :: PositionRead -> FileOffset -> ByteCount -> Sentinel -> DynaNext
-fillBufFile pread start bytes sentinel buf room = do
+fillBufFile pread start bytes sentinel = DynaNext $ \buf room -> do
     len <- pread start (mini room bytes) buf
     case sentinel of
         Refresher refresh -> refresh
