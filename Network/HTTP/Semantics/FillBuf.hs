@@ -166,6 +166,7 @@ runStreamingChunk chunk next =
 
     flush :: NextWithTotal
     flush = \total _buf _room -> do
+        putStrLn "\n\nHTTP-SEMANTICS: RETURNING FROM NEXTWITHTOTAL\n\n"
         return $ Next total True (Just $ next 0)
 
     -- Cancel streaming
