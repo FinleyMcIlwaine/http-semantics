@@ -104,10 +104,16 @@ fillStreamBodyGetNext takeQ = loop 0
   where
     loop :: NextWithTotal
     loop total buf room = do
+        putStrLn "\n\nHTTP-SEMANTICS: TAKING QUEUE\n\n"
         mChunk <- takeQ
+        putStrLn "\n\nHTTP-SEMANTICS: TOOK QUEUE\n\n"
         case mChunk of
-            Just chunk -> runStreamingChunk chunk loop total buf room
-            Nothing -> return $ Next total False (Just $ loop 0)
+            Just chunk -> do
+                putStrLn "\n\nHTTP-SEMANTICS: QUEUE GAVE JUST\n\n"
+                runStreamingChunk chunk loop total buf room
+            Nothing -> do
+                putStrLn "\n\nHTTP-SEMANTICS: QUEUE GAVE NOTHING\n\n"
+                return $ Next total False (Just $ loop 0)
 
 ----------------------------------------------------------------
 
